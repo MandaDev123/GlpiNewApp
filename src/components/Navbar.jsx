@@ -38,6 +38,9 @@ const Navbar = () => {
             <Link to="/admin/import" style={{ color: 'var(--text-muted)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px' }}>
               <Database size={18} /> Import Data
             </Link>
+            <Link to="/admin/importTicket" style={{ color: 'var(--text-muted)', textDecoration: 'none', display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px' }}>
+              <Database size={18} /> Import Ticket
+            </Link>
             <button onClick={handleLogout} className="btn btn-danger" style={{ padding: '6px 12px', fontSize: '12px' }}>
               <LogOut size={14} /> Déconnexion
             </button>

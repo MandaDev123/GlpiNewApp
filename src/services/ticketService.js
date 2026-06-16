@@ -34,6 +34,30 @@ const parseStatus = (statusStr) => {
   }
 };
 
+// URL de base du backend Node local (SQLite) pour les nouveaux coûts
+const LOCAL_API_BASE = 'http://localhost:5000/api';
+
+/**
+ * Calcule le coût total "réel" d'un ticket à partir des coûts GLPI,
+ * en appliquant la même formule que la page TicketDetail (coût horaire
+ * calculé sur la durée + coûts fixes + coûts matériels).
+ */
+export const computeGlpiCostTotal = (costs) => {
+  const list = Array.isArray(costs) ? costs : [];
+
+  const totalTimeCost = list.reduce((sum, c) => {
+    const durationMin = parseInt(c.actiontime || 0) / 60;
+    const hourlyRate  = parseFloat(c.cost_time || 0);
+    return sum + (durationMin / 60) * hourlyRate;
+  }, 0);
+
+  const totalFixedCost    = list.reduce((sum, c) => sum + parseFloat(c.cost_fixed || 0), 0);
+  const totalMaterialCost = list.reduce((sum, c) => sum + parseFloat(c.cost_material || 0), 0);
+
+  return totalTimeCost + totalFixedCost + totalMaterialCost;
+};
+
+
 export const ticketService = {
   /**
    * Récupère tous les tickets avec les valeurs lisibles (expand_dropdowns)
@@ -177,8 +201,91 @@ createTicket: async (formData, selectedItems) => {
     }
   },
   /**
-   * Met à jour un ticket existant (ex: changement de statut ou ajout de solution)
+   * Ajoute un nouveau coût pour un ticket dans le backend Node local (SQLite)
    */
+  addTicketCost: async (ticketId, amount ) => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/ticket-costs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticket_id: ticketId, amount })
+      });
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || 'Erreur lors de l\'enregistrement du coût.');
+      }
+      return await response.json();
+    } catch (error) {
+      console.error(`Erreur lors de l'ajout du coût pour le ticket ${ticketId} :`, error);
+      throw error;
+    }
+  },
+
+  /**
+   * Récupère le détail + le total des nouveaux coûts (locaux, SQLite) d'un ticket
+   */
+  getLocalTicketCosts: async (ticketId) => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/ticket-costs/${ticketId}`);
+      if (!response.ok) throw new Error('Erreur lors de la récupération des nouveaux coûts.');
+      return await response.json(); // { items: [...], total: number }
+    } catch (error) {
+      console.error(`Erreur lors de la récupération des nouveaux coûts du ticket ${ticketId} :`, error);
+      return { items: [], total: 0 };
+    }
+  },
+
+  addTicketFrais: async (ticketId, amount) => {
+  try {
+    const response = await fetch(`http://localhost:5000/api/ticket-frais`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticket_id: ticketId, amount })
+    });
+    if (!response.ok) throw new Error('Erreur lors de l\'enregistrement du frais.');
+    return await response.json();
+  } catch (error) {
+    console.error(`Erreur addTicketFrais ticket ${ticketId} :`, error);
+    throw error;
+  }
+},
+
+getAllLocalFraisTotals: async () => {
+  try {
+    const response = await fetch(`http://localhost:5000/api/ticket-frais`);
+    if (!response.ok) throw new Error();
+    return await response.json();
+  } catch {
+    return {};
+  }
+},
+
+  /**
+   * Récupère le total des nouveaux coûts (locaux) groupés par ticket
+   * Renvoie un objet { [ticketId]: totalAmount }
+   */
+  getAllLocalCostTotals: async () => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/ticket-costs`);
+      if (!response.ok) throw new Error('Erreur lors de la récupération du récapitulatif des coûts.');
+      return await response.json();
+    } catch (error) {
+      console.error('Erreur lors de la récupération du récapitulatif des nouveaux coûts :', error);
+      return {};
+    }
+  },
+
+  getAllLocalFraisTotals: async () => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/ticket-frais`);
+      if (!response.ok) throw new Error('Erreur lors de la récupération du récapitulatif des coûts.');
+      return await response.json();
+    } catch (error) {
+      console.error('Erreur lors de la récupération du récapitulatif des nouveaux coûts :', error);
+      return {};
+    }
+  },
+
   updateTicket: async (ticketId, payload) => {
     await ensureSession();
     
@@ -196,6 +303,19 @@ createTicket: async (formData, selectedItems) => {
       console.error(`Erreur lors de la mise à jour du ticket ${ticketId} :`, error);
       throw error;
     }
-  }
+  },
   
+  importTicket: async (mouvement) => {
+    const response = await fetch(`${LOCAL_API_BASE}/ticket_mouvement/details`,{
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mouvement })
+    });
+    return await response.json();
+  },
+
+  getTicketMouvement : async (ticket_id) => {
+    const response = await fetch(`${LOCAL_API_BASE}/ticket_mouvement/${ticket_id}`);
+      return await response.json;
+    }
 };

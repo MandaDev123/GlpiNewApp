@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useData } from '../../context/DataContext';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Settings, Loader } from 'lucide-react';
-import { ticketService } from '../../services/ticketService';
+import { Plus, Settings, Loader, DollarSign } from 'lucide-react';
+import { ticketService, computeGlpiCostTotal } from '../../services/ticketService';
 
-const TYPE_LABEL   = { 1: 'Incident', 2: 'Demande' };
+const TYPE_LABEL = { 1: 'Incident', 2: 'Demande' };
 const PRIORITY_LABEL = { 1: 'Très basse', 2: 'Basse', 3: 'Moyenne', 4: 'Haute', 5: 'Très haute' };
 const STATUSES = ['New', 'In_Progress', 'Closed'];
 
@@ -14,21 +14,25 @@ const TicketKanban = () => {
 
   // Configuration dynamique des colonnes
   const [kanbanConfig, setKanbanConfig] = useState({
-    New:         { color: '#fee2e2', border: '#fca5a5', label: 'Vaovao',    sub: 'New'         },
+    New: { color: '#fee2e2', border: '#fca5a5', label: 'Vaovao', sub: 'New' },
     In_Progress: { color: '#fef3c7', border: '#fcd34d', label: 'Efa manao', sub: 'In Progress' },
-    Closed:      { color: '#dcfce7', border: '#86efac', label: 'Vita',      sub: 'Closed'      },
+    Closed: { color: '#dcfce7', border: '#86efac', label: 'Vita', sub: 'Closed' },
   });
 
-  const [dragOverStatus, setDragOverStatus]     = useState(null);
-  
+  const [dragOverStatus, setDragOverStatus] = useState(null);
+
   // États pour la consultation des détails complets
-  const [selectedTicket, setSelectedTicket]     = useState(null);
-  const [loadingDetails, setLoadingDetails]     = useState(false);
-  const [ticketDetails, setTicketDetails]       = useState(null);
+  const [selectedTicket, setSelectedTicket] = useState(null);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [ticketDetails, setTicketDetails] = useState(null);
 
   // États pour les changements de statut nécessitant une action / boîte de dialogue
   const [transitioningTicket, setTransitioningTicket] = useState(null);
-  const [comment, setComment]                   = useState('');
+  const [comment, setComment] = useState('');
+  const [newCostAmount, setNewCostAmount] = useState('');
+  const [savingTransition, setSavingTransition] = useState(false);
+  const [reopenPercentage, setReopenPercentage] = useState('');
+  const [lastCostAmount, setLastCostAmount] = useState(0);
 
   // Charger les configurations d'affichage au montage
   useEffect(() => {
@@ -49,6 +53,8 @@ const TicketKanban = () => {
   // Déclenche la boîte de dialogue si on transite vers "Closed"
   const needsAdditionalInfo = (fromStatus, toStatus) => toStatus === 'Closed';
 
+  const needsAdditionalInfoinprogress = (fromStatus, toStatus) => toStatus === 'In_Progress';
+
   // ── Drag & Drop ──────────────────────────────────────────────────────────
   const handleDragStart = (e, ticket) => {
     // Utilisation stricte de l'ID GLPI unique (id ou id du ticket normalisé)
@@ -63,28 +69,74 @@ const TicketKanban = () => {
 
   const handleDragLeave = () => setDragOverStatus(null);
 
-  const handleDrop = (e, targetStatus) => {
+  const handleDrop = async (e, targetStatus) => {
     e.preventDefault();
     setDragOverStatus(null);
-    
+
     const id = e.dataTransfer.getData('ticketId');
     const ticket = tickets.find(t => String(t.id) === id);
     if (!ticket || ticket.Status === targetStatus) return;
 
-    if (needsAdditionalInfo(ticket.Status, targetStatus)) {
-      setTransitioningTicket({ ticket, targetStatus });
+    // Closed → In_Progress : boîte de réouverture
+    if (ticket.Status === 'Closed' && targetStatus === 'In_Progress') {
+      // Charger le dernier coût enregistré pour pré-remplir le pourcentage
+      const localCosts = await ticketService.getLocalTicketCosts(ticket.id);
+      const lastAmount = localCosts.items?.[0]?.amount || 0; // trié DESC, donc [0] = le plus récent
+      setLastCostAmount(parseFloat(lastAmount));
+      setReopenPercentage('20'); // valeur par défaut 20%
+      setTransitioningTicket({ ticket, targetStatus, mode: 'reopen' });
       setComment('');
-    } else {
-      // Modifie le statut directement via l'API pour les autres colonnes
-      updateTicketStatus(ticket.id, targetStatus);
+      setNewCostAmount('');
+      return;
     }
+
+    // * → Closed : boîte de clôture
+    if (targetStatus === 'Closed') {
+      setTransitioningTicket({ ticket, targetStatus, mode: 'close' });
+      setComment('');
+      setNewCostAmount('');
+      return;
+    }
+
+    // Tous les autres cas : transition directe
+    updateTicketStatus(ticket.id, targetStatus);
   };
 
-  const confirmTransition = () => {
+
+  const confirmTransition = async () => {
     if (!transitioningTicket) return;
-    updateTicketStatus(transitioningTicket.ticket.id, transitioningTicket.targetStatus, comment);
-    setTransitioningTicket(null);
-    setComment('');
+    setSavingTransition(true);
+
+    try {
+      const { ticket, targetStatus, mode } = transitioningTicket;
+
+      if (mode === 'close') {
+        await updateTicketStatus(ticket.id, targetStatus, comment);
+        const amount = parseFloat(newCostAmount);
+        if (!isNaN(amount) && amount > 0) {
+          await ticketService.addTicketCost(ticket.id, amount);
+        }
+      }
+
+      if (mode === 'reopen') {
+        await updateTicketStatus(ticket.id, targetStatus, comment);
+        const pct = parseFloat(reopenPercentage);
+        if (!isNaN(pct) && pct > 0 && lastCostAmount > 0) {
+          const fraisAmount = (lastCostAmount * pct) / 100;
+          await ticketService.addTicketFrais(ticket.id, fraisAmount);
+        }
+      }
+    } catch (error) {
+      console.error('Erreur transition :', error);
+      alert('Une erreur est survenue lors de la transition.');
+    } finally {
+      setSavingTransition(false);
+      setTransitioningTicket(null);
+      setComment('');
+      setNewCostAmount('');
+      setReopenPercentage('');
+      setLastCostAmount(0);
+    }
   };
 
   // ── Chargement des détails complets au clic ──────────────────────────────
@@ -95,16 +147,19 @@ const TicketKanban = () => {
 
     try {
       // Appels simultanés via le ticketService pour récupérer TOUTES les infos correctes
-      const [fullTicket, costs, items] = await Promise.all([
+      const [fullTicket, costs, items, localCosts] = await Promise.all([
         ticketService.getTicketById(ticket.id),
         ticketService.getTicketCosts(ticket.id),
-        ticketService.getTicketItems(ticket.id)
+        ticketService.getTicketItems(ticket.id),
+        ticketService.getLocalTicketCosts(ticket.id)
       ]);
 
       setTicketDetails({
         ...fullTicket,
         costs: Array.isArray(costs) ? costs : [],
-        items: Array.isArray(items) ? items : []
+        items: Array.isArray(items) ? items : [],
+        localCosts: localCosts.items || [],
+        localCostsTotal: localCosts.total || 0
       });
     } catch (error) {
       console.error("Erreur lors de la récupération du détail complet du ticket", error);
@@ -121,6 +176,13 @@ const TicketKanban = () => {
           Tableau Kanban des Tickets {loadingTickets && <Loader size={18} className="animate-spin" style={{ display: 'inline', marginLeft: 10 }} />}
         </h1>
         <div style={{ display: 'flex', gap: '10px' }}>
+          <button
+            className="btn"
+            onClick={() => navigate('/cout')}
+            style={{ display: 'flex', alignItems: 'center', gap: '8px', background: '#e5e7eb', border: 'none', padding: '8px 12px', borderRadius: '6px', cursor: 'pointer' }}
+          >
+            <DollarSign size={18} /> Récapitulatif des coûts
+          </button>
           <button
             className="btn"
             onClick={() => navigate('/admin/kanban-settings')}
@@ -142,8 +204,8 @@ const TicketKanban = () => {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '20px', alignItems: 'start' }}>
         {STATUSES.map(status => {
           const columnTickets = tickets.filter(t => t.Status === status);
-          const cfg           = kanbanConfig[status];
-          const isOver        = dragOverStatus === status;
+          const cfg = kanbanConfig[status];
+          const isOver = dragOverStatus === status;
 
           return (
             <div
@@ -197,7 +259,7 @@ const TicketKanban = () => {
                         <span style={{ fontWeight: 600 }}>#{ticket.id}</span>
                         <span style={{
                           background: Number(ticket.type) === 2 ? '#eff6ff' : '#fef2f2',
-                          color:      Number(ticket.type) === 2 ? '#2563eb' : '#dc2626',
+                          color: Number(ticket.type) === 2 ? '#2563eb' : '#dc2626',
                           padding: '1px 6px', borderRadius: '4px', fontSize: '10px', fontWeight: 600
                         }}>
                           {TYPE_LABEL[ticket.type] || 'N/A'}
@@ -229,7 +291,7 @@ const TicketKanban = () => {
       {selectedTicket && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000 }} onClick={() => setSelectedTicket(null)}>
           <div className="glass-panel" onClick={e => e.stopPropagation()} style={{ background: 'white', padding: '28px', borderRadius: '14px', maxWidth: '650px', width: '100%', maxHeight: '85vh', overflowY: 'auto', color: '#1f2937' }}>
-            
+
             <h2 style={{ margin: '0 0 20px 0', fontSize: '20px', borderBottom: '2px solid #f3f4f6', paddingBottom: '10px' }}>
               Détails du Ticket #{selectedTicket.id}
             </h2>
@@ -243,7 +305,7 @@ const TicketKanban = () => {
                 {/* Infos principales */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '20px' }}>
                   <div><strong>Titre :</strong> {ticketDetails.name || '—'}</div>
-                  <div><strong>Description :</strong> 
+                  <div><strong>Description :</strong>
                     <div style={{ background: '#f9fafb', padding: '10px', borderRadius: '6px', marginTop: '5px', fontSize: '13px' }} dangerouslySetInnerHTML={{ __html: ticketDetails.content }} />
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
@@ -275,17 +337,48 @@ const TicketKanban = () => {
                   </table>
                 )}
 
-                {/* Coûts associés (TicketCost) */}
+                {/* Coûts associés (TicketCost GLPI + nouveaux coûts locaux) */}
                 <h3 style={{ fontSize: '15px', borderTop: '1px solid #e5e7eb', paddingTop: '15px', marginTop: '15px' }}>Coûts financiers</h3>
-                {ticketDetails.costs.length === 0 ? <p style={{ fontSize: '13px', color: '#9ca3af', fontStyle: 'italic' }}>Aucun coût enregistré.</p> : (
-                  <ul style={{ fontSize: '13px', paddingLeft: '20px' }}>
-                    {ticketDetails.costs.map((cost, idx) => (
-                      <li key={idx}>
-                        <strong>{cost.name || 'Coût'} :</strong> {cost.cost} € (Matériel : {cost.itemcost || '0'} €)
-                      </li>
-                    ))}
-                  </ul>
-                )}
+
+                {(() => {
+                  const glpiTotal = computeGlpiCostTotal(ticketDetails.costs);
+                  const localTotal = ticketDetails.localCostsTotal || 0;
+                  const grandTotal = glpiTotal + localTotal;
+
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', fontSize: '13px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <span>Coûts GLPI existants (temps + fixe + matériel) :</span>
+                        <strong>{glpiTotal.toFixed(2)} €</strong>
+                      </div>
+
+                      <div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span>Nouveaux coûts ajoutés :</span>
+                          <strong>{localTotal.toFixed(2)} €</strong>
+                        </div>
+                        {ticketDetails.localCosts.length > 0 && (
+                          <ul style={{ margin: '6px 0 0 0', paddingLeft: '20px', color: '#6b7280' }}>
+                            {ticketDetails.localCosts.map((c) => (
+                              <li key={c.id}>
+                                {parseFloat(c.amount).toFixed(2)} € {c.comment ? `— ${c.comment}` : ''}
+                                {' '}
+                                <span style={{ fontSize: '11px' }}>
+                                  ({new Date(c.created_at).toLocaleString('fr-FR')})
+                                </span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+
+                      <div style={{ display: 'flex', justifyContent: 'space-between', borderTop: '1px solid #e5e7eb', paddingTop: '8px', fontSize: '15px' }}>
+                        <strong>Coût total :</strong>
+                        <strong style={{ color: 'var(--accent, #10b981)' }}>{grandTotal.toFixed(2)} €</strong>
+                      </div>
+                    </div>
+                  );
+                })()}
               </div>
             ) : (
               <p style={{ color: '#ef4444' }}>Erreur lors du chargement des détails.</p>
@@ -299,32 +392,144 @@ const TicketKanban = () => {
       )}
 
       {/* MODAL : Boîte de dialogue pour clôture obligatoire avec commentaire */}
+      {/* MODAL : Clôture (Closed) et Réouverture (In_Progress) */}
       {transitioningTicket && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000 }}>
           <div className="glass-panel" style={{ background: 'white', padding: '28px', borderRadius: '14px', maxWidth: '420px', width: '100%', color: '#1f2937' }}>
-            <h3 style={{ margin: '0 0 10px 0', fontSize: '16px' }}>Clôturer le ticket ?</h3>
-            <p style={{ fontSize: '14px', color: '#4b5563', marginBottom: '16px' }}>
-              Ticket <strong>#{transitioningTicket.ticket.id}</strong> → <strong>{kanbanConfig.Closed.label} (Closed)</strong>.<br/>
-              Veuillez saisir un commentaire de résolution pour GLPI :
-            </p>
-            <textarea
-              rows={3}
-              value={comment}
-              onChange={e => setComment(e.target.value)}
-              placeholder="Décrivez la solution apportée..."
-              style={{ width: '100%', boxSizing: 'border-box', padding: '10px', borderRadius: '6px', border: '1px solid #d1d5db', resize: 'vertical' }}
-            />
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
-              <button className="btn" style={{ padding: '8px 12px', background: '#e5e7eb', border: 'none', borderRadius: '6px', cursor: 'pointer' }} onClick={() => setTransitioningTicket(null)}>Annuler</button>
-              <button
-                className="btn btn-primary"
-                onClick={confirmTransition}
-                disabled={!comment.trim()}
-                style={{ padding: '8px 12px', background: '#2563eb', color: 'white', border: 'none', borderRadius: '6px', cursor: comment.trim() ? 'pointer' : 'not-allowed', opacity: comment.trim() ? 1 : 0.5 }}
-              >
-                Valider la clôture
-              </button>
-            </div>
+
+            {/* ── MODE CLÔTURE ── */}
+            {transitioningTicket.mode === 'close' && (<>
+              <h3 style={{ margin: '0 0 10px 0', fontSize: '16px' }}>Clôturer le ticket ?</h3>
+              <p style={{ fontSize: '14px', color: '#4b5563', marginBottom: '16px' }}>
+                Ticket <strong>#{transitioningTicket.ticket.id}</strong> → <strong>Closed</strong>.<br />
+                Veuillez saisir un commentaire de résolution pour GLPI :
+              </p>
+              <textarea
+                rows={3}
+                value={comment}
+                onChange={e => setComment(e.target.value)}
+                placeholder="Décrivez la solution apportée..."
+                style={{ width: '100%', boxSizing: 'border-box', padding: '10px', borderRadius: '6px', border: '1px solid #d1d5db', resize: 'vertical' }}
+              />
+              <div style={{ marginTop: '16px', borderTop: '1px solid #e5e7eb', paddingTop: '14px' }}>
+                <p style={{ fontSize: '14px', color: '#4b5563', margin: '0 0 8px 0' }}>Ajouter un coût pour ce ticket (optionnel) :</p>
+                <input
+                  type="number" min="0" step="0.01"
+                  value={newCostAmount}
+                  onChange={e => setNewCostAmount(e.target.value)}
+                  placeholder="Montant (€)"
+                  style={{ width: '100%', boxSizing: 'border-box', padding: '10px', borderRadius: '6px', border: '1px solid #d1d5db' }}
+                />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                <button style={{ padding: '8px 12px', background: '#e5e7eb', border: 'none', borderRadius: '6px', cursor: 'pointer' }} onClick={() => setTransitioningTicket(null)}>Annuler</button>
+                <button
+                  onClick={confirmTransition}
+                  disabled={!comment.trim() || savingTransition}
+                  style={{ padding: '8px 12px', background: '#2563eb', color: 'white', border: 'none', borderRadius: '6px', cursor: (comment.trim() && !savingTransition) ? 'pointer' : 'not-allowed', opacity: (comment.trim() && !savingTransition) ? 1 : 0.5 }}
+                >
+                  {savingTransition ? 'Enregistrement...' : 'Valider la clôture'}
+                </button>
+              </div>
+            </>)}
+
+            {/* ── MODE RÉOUVERTURE ── */}
+            {transitioningTicket.mode === 'reopen' && (<>
+              <h3 style={{ margin: '0 0 10px 0', fontSize: '16px' }}>Réouvrir le ticket ?</h3>
+              <p style={{ fontSize: '14px', color: '#4b5563', marginBottom: '16px' }}>
+                Ticket <strong>#{transitioningTicket.ticket.id}</strong> → <strong>En cours</strong>.<br />
+                Dernier coût enregistré : <strong>{lastCostAmount.toFixed(2)} €</strong>
+              </p>
+              <div>
+                <p style={{ fontSize: '14px', color: '#4b5563', margin: '0 0 8px 0' }}>Frais de réouverture (% du dernier coût) :</p>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <input
+                    type="number" min="0" max="100" step="1"
+                    value={reopenPercentage}
+                    onChange={e => setReopenPercentage(e.target.value)}
+                    placeholder="% ex: 20"
+                    style={{ flex: '0 0 100px', padding: '10px', borderRadius: '6px', border: '1px solid #d1d5db' }}
+                  />
+                  <span style={{ fontSize: '13px', color: '#6b7280' }}>
+                    = {(lastCostAmount * (parseFloat(reopenPercentage) || 0) / 100).toFixed(2)} €
+                  </span>
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
+                <button style={{ padding: '8px 12px', background: '#e5e7eb', border: 'none', borderRadius: '6px', cursor: 'pointer' }} onClick={() => setTransitioningTicket(null)}>Annuler</button>
+                <button
+                  onClick={async () => {
+                    setSavingTransition(true);
+                    try {
+                      const ticketId = transitioningTicket.ticket.id;
+                      const targetStatus = transitioningTicket.targetStatus;
+
+                      // 1. Récupérer les coûts locaux associés à ce ticket GLPI
+                      const responseCosts = await fetch(`http://localhost:5000/api/ticket-costs/${ticketId}`);
+                      if (!responseCosts.ok) throw new Error("Impossible de vérifier les coûts locaux.");
+
+                      const localCosts = await responseCosts.json(); // Renvoie { items: [...], total: X }
+
+                      // 2. Vérification STRICTE : Y a-t-il un élément dans le tableau ?
+                      if (localCosts && Array.isArray(localCosts.items) && localCosts.items.length > 0) {
+                        const trueRows = localCosts.items;
+                        const lastRow = trueRows[0]; // Le plus récent (trié par DESC sur le serveur)
+
+                        // Sécurité ultime : on s'assure que la ligne SQLite a bien un ID et qu'il est différent de l'ID du ticket
+                        if (lastRow && lastRow.id) {
+                          console.log(`Tentative de suppression de la ligne de coût SQLite n°${lastRow.id} (pour le ticket GLPI #${ticketId})`);
+
+                          const deleteResponse = await fetch(`http://localhost:5000/api/ticket-costs/${lastRow.id}`, {
+                            method: 'DELETE'
+                          });
+
+                          if (!deleteResponse.ok) {
+                            throw new Error("Le serveur local a refusé la suppression de la ligne.");
+                          }
+                          console.log("Coût local supprimé avec succès.");
+                        }
+                      } else {
+                        // Le tableau est vide (comme pour votre ticket 11) : on ne fait AUCUN DELETE
+                        console.log(`Aucun coût local trouvé dans SQLite pour le ticket #${ticketId}. Passage direct à la réouverture.`);
+                      }
+
+                      // 3. Changement de statut dans GLPI (s'exécute dans tous les cas)
+                      await updateTicketStatus(ticketId, targetStatus);
+
+                    } catch (err) {
+                      console.error('Erreur lors du processus de réouverture :', err);
+                      alert(`Erreur : ${err.message}`);
+                    } finally {
+                      setSavingTransition(false);
+                      setTransitioningTicket(null);
+                      setReopenPercentage('');
+                      setLastCostAmount(0);
+                    }
+                  }}
+                  disabled={savingTransition}
+                  style={{
+                    padding: '8px 12px',
+                    background: '#ef4444',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '6px',
+                    cursor: savingTransition ? 'not-allowed' : 'pointer',
+                    opacity: savingTransition ? 0.5 : 1
+                  }}
+                >
+                  {savingTransition ? '...' : 'Annuler le dernier coût'}
+                </button>
+
+                <button
+                  onClick={confirmTransition}
+                  disabled={savingTransition}
+                  style={{ padding: '8px 12px', background: '#d97706', color: 'white', border: 'none', borderRadius: '6px', cursor: savingTransition ? 'not-allowed' : 'pointer', opacity: savingTransition ? 0.5 : 1 }}
+                >
+                  {savingTransition ? 'Enregistrement...' : 'Confirmer la réouverture'}
+                </button>
+              </div>
+            </>)}
+
           </div>
         </div>
       )}
