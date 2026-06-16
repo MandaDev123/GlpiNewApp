@@ -1,36 +1,47 @@
 import React, { useState, useEffect } from 'react';
 import { useData } from '../../context/DataContext';
 import { useNavigate } from 'react-router-dom';
-import { Plus, Settings, Loader } from 'lucide-react';
+import { Plus, Settings, Loader, DollarSign, Eye, Clock, AlertCircle, ArrowLeft, X } from 'lucide-react';
 import { ticketService } from '../../services/ticketService';
 
-const TYPE_LABEL   = { 1: 'Incident', 2: 'Demande' };
+const TYPE_LABEL = { 1: 'Incident', 2: 'Demande' };
 const PRIORITY_LABEL = { 1: 'Très basse', 2: 'Basse', 3: 'Moyenne', 4: 'Haute', 5: 'Très haute' };
 const STATUSES = ['New', 'In_Progress', 'Closed'];
+
+// Affichage des 3 types canoniques de la table unique "mouvements"
+const MOUVEMENT_DISPLAY = {
+  close:  { label: 'Clôture',     color: '#16a34a' },
+  open:   { label: 'Réouverture', color: '#d97706' },
+  cancel: { label: 'Annulation',  color: '#dc2626' },
+};
 
 const TicketKanban = () => {
   const { tickets, updateTicketStatus, loadingTickets } = useData();
   const navigate = useNavigate();
 
-  // Configuration dynamique des colonnes
+  // Configuration dynamique des couleurs des colonnes du Kanban
   const [kanbanConfig, setKanbanConfig] = useState({
-    New:         { color: '#fee2e2', border: '#fca5a5', label: 'Vaovao',    sub: 'New'         },
+    New: { color: '#fee2e2', border: '#fca5a5', label: 'Vaovao', sub: 'New' },
     In_Progress: { color: '#fef3c7', border: '#fcd34d', label: 'Efa manao', sub: 'In Progress' },
-    Closed:      { color: '#dcfce7', border: '#86efac', label: 'Vita',      sub: 'Closed'      },
+    Closed: { color: '#dcfce7', border: '#86efac', label: 'Vita', sub: 'Closed' },
   });
 
-  const [dragOverStatus, setDragOverStatus]     = useState(null);
+  const [dragOverStatus, setDragOverStatus] = useState(null);
   
-  // États pour la consultation des détails complets
-  const [selectedTicket, setSelectedTicket]     = useState(null);
-  const [loadingDetails, setLoadingDetails]     = useState(false);
-  const [ticketDetails, setTicketDetails]       = useState(null);
+  // États pour la consultation des détails complets d'un ticket
+  const [selectedTicket, setSelectedTicket] = useState(null);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [localMouvements, setLocalMouvements] = useState([]);
+  const [totalCost, setTotalCost] = useState(0);
 
-  // États pour les changements de statut nécessitant une action / boîte de dialogue
+  // États pour les boîtes de dialogue de transition financière
   const [transitioningTicket, setTransitioningTicket] = useState(null);
-  const [comment, setComment]                   = useState('');
+  const [newCostAmount, setNewCostAmount] = useState('');
+  const [reopenPercentage, setReopenPercentage] = useState('');
+  const [lastCostAmount, setLastCostAmount] = useState(0);
+  const [savingTransition, setSavingTransition] = useState(false);
 
-  // Charger les configurations d'affichage au montage
+  // Charger les configurations de couleurs depuis le serveur SQLite au démarrage
   useEffect(() => {
     fetch('http://localhost:5000/api/kanban-settings')
       .then(res => res.json())
@@ -42,16 +53,11 @@ const TicketKanban = () => {
             Closed: { color: data.Closed.color, border: data.Closed.color, label: data.Closed.labelMalgache, sub: 'Closed' }
           });
         }
-      })
-      .catch(err => console.error("Impossible de charger les styles personnalisés", err));
+      }).catch(err => console.error("Erreur de chargement des paramètres Kanban:", err));
   }, []);
 
-  // Déclenche la boîte de dialogue si on transite vers "Closed"
-  const needsAdditionalInfo = (fromStatus, toStatus) => toStatus === 'Closed';
-
-  // ── Drag & Drop ──────────────────────────────────────────────────────────
+  // Gestion du Drag & Drop
   const handleDragStart = (e, ticket) => {
-    // Utilisation stricte de l'ID GLPI unique (id ou id du ticket normalisé)
     e.dataTransfer.setData('ticketId', String(ticket.id));
     e.dataTransfer.effectAllowed = 'move';
   };
@@ -63,271 +69,405 @@ const TicketKanban = () => {
 
   const handleDragLeave = () => setDragOverStatus(null);
 
-  const handleDrop = (e, targetStatus) => {
+  const handleDrop = async (e, targetStatus) => {
     e.preventDefault();
     setDragOverStatus(null);
-    
+
     const id = e.dataTransfer.getData('ticketId');
     const ticket = tickets.find(t => String(t.id) === id);
     if (!ticket || ticket.Status === targetStatus) return;
 
-    if (needsAdditionalInfo(ticket.Status, targetStatus)) {
-      setTransitioningTicket({ ticket, targetStatus });
-      setComment('');
-    } else {
-      // Modifie le statut directement via l'API pour les autres colonnes
-      updateTicketStatus(ticket.id, targetStatus);
+    // SCÉNARIO : Passage de "Closed" (Terminé) vers "In_Progress" (En cours)
+    if (ticket.Status === 'Closed' && targetStatus === 'In_Progress') {
+      const lastAmount = await ticketService.getLastCostAmount(ticket.id);
+      setLastCostAmount(parseFloat(lastAmount));
+      setReopenPercentage('');
+      setTransitioningTicket({ ticket, targetStatus, mode: 'reopen' });
+      return;
     }
+
+    // SCÉNARIO : Changement vers "Closed" (Terminé) depuis n'importe quel statut
+    if (targetStatus === 'Closed') {
+      setTransitioningTicket({ ticket, targetStatus, mode: 'close' });
+      setNewCostAmount('');
+      return;
+    }
+
+    // Changement standard direct pour les autres colonnes
+    updateTicketStatus(ticket.id, targetStatus);
   };
 
-  const confirmTransition = () => {
-    if (!transitioningTicket) return;
-    updateTicketStatus(transitioningTicket.ticket.id, transitioningTicket.targetStatus, comment);
-    setTransitioningTicket(null);
-    setComment('');
-  };
-
-  // ── Chargement des détails complets au clic ──────────────────────────────
-  const handleTicketClick = async (ticket) => {
+  // Ouvrir le panneau de détails complets d'un ticket et charger l'historique COMPLET
+  // de ses mouvements (open + cancel + close) depuis la table unique.
+  const handleOpenDetails = async (ticket) => {
     setSelectedTicket(ticket);
     setLoadingDetails(true);
-    setTicketDetails(null);
-
     try {
-      // Appels simultanés via le ticketService pour récupérer TOUTES les infos correctes
-      const [fullTicket, costs, items] = await Promise.all([
-        ticketService.getTicketById(ticket.id),
-        ticketService.getTicketCosts(ticket.id),
-        ticketService.getTicketItems(ticket.id)
-      ]);
-
-      setTicketDetails({
-        ...fullTicket,
-        costs: Array.isArray(costs) ? costs : [],
-        items: Array.isArray(items) ? items : []
-      });
-    } catch (error) {
-      console.error("Erreur lors de la récupération du détail complet du ticket", error);
+      const mouvements = await ticketService.getTicketMouvement(ticket.id);
+      const list = Array.isArray(mouvements) ? mouvements : [];
+      const total = list.reduce((sum, m) => sum + parseFloat(m.amount || 0), 0);
+      setLocalMouvements(list);
+      setTotalCost(total);
+    } catch (err) {
+      console.error("Erreur de chargement des détails financiers:", err);
     } finally {
       setLoadingDetails(false);
     }
   };
 
   return (
-    <div style={{ padding: '20px' }}>
-      {/* En-tête */}
+    <div style={{ padding: '20px', fontFamily: 'Arial, sans-serif' }}>
+      
+      {/* EN-TÊTE DU TABLEAU */}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '28px' }}>
-        <h1 style={{ margin: 0, fontSize: '24px' }}>
-          Tableau Kanban des Tickets {loadingTickets && <Loader size={18} className="animate-spin" style={{ display: 'inline', marginLeft: 10 }} />}
-        </h1>
-        <div style={{ display: 'flex', gap: '10px' }}>
-          <button
-            className="btn"
-            onClick={() => navigate('/admin/kanban-settings')}
-            style={{ display: 'flex', alignItems: 'center', gap: '8px', background: '#e5e7eb', border: 'none', padding: '8px 12px', borderRadius: '6px', cursor: 'pointer' }}
+        <h1 style={{ margin: 0, fontSize: '24px', color: '#111827' }}>Tableau Kanban des Tickets</h1>
+        <div style={{ display: 'flex', gap: '12px' }}>
+          <button 
+            onClick={() => navigate('/admin/importTicket')} 
+            style={{ padding: '10px 16px', borderRadius: '6px', cursor: 'pointer', background: '#2563eb', color: 'white', border: 'none', fontWeight: '600' }}
           >
-            <Settings size={18} /> Personnaliser
+            Importer Flux Mouvements
           </button>
-          <button
-            className="btn btn-primary"
-            onClick={() => navigate('/create-ticket')}
-            style={{ display: 'flex', alignItems: 'center', gap: '8px' }}
+          <button 
+            onClick={() => navigate('/cout')} 
+            style={{ display: 'flex', alignItems: 'center', gap: '8px', background: '#e5e7eb', color: '#1f2937', border: 'none', padding: '10px 16px', borderRadius: '6px', cursor: 'pointer', fontWeight: '600' }}
           >
-            <Plus size={18} /> Ajouter 1 ticket
+            <DollarSign size={18} /> Récapitulatif Global
           </button>
         </div>
       </div>
 
-      {/* Colonnes Kanban */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '20px', alignItems: 'start' }}>
-        {STATUSES.map(status => {
-          const columnTickets = tickets.filter(t => t.Status === status);
-          const cfg           = kanbanConfig[status];
-          const isOver        = dragOverStatus === status;
+      {loadingTickets ? (
+        <div style={{ textAlign: 'center', padding: '40px', color: '#4b5563' }}>
+          <Loader className="animate-spin" style={{ margin: '0 auto 10px auto' }} />
+          Chargement des tickets depuis GLPI...
+        </div>
+      ) : (
+        /* COLONNES DU KANBAN */
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '20px' }}>
+          {STATUSES.map(status => {
+            const columnTickets = tickets.filter(t => t.Status === status);
+            const cfg = kanbanConfig[status];
+            const isOver = dragOverStatus === status;
 
-          return (
-            <div
-              key={status}
-              onDragOver={(e) => handleDragOver(e, status)}
-              onDragLeave={handleDragLeave}
-              onDrop={(e) => handleDrop(e, status)}
-              className="glass-panel"
-              style={{
-                backgroundColor: isOver ? 'rgba(0,0,0,0.05)' : cfg.color,
-                border: `2px solid ${isOver ? '#1f2937' : 'transparent'}`,
-                minHeight: '520px',
-                padding: '16px',
-                borderRadius: '12px',
-                transition: 'background-color 0.2s, border-color 0.2s',
-              }}
-            >
-              {/* Titre Colonne */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px', borderBottom: `2px solid rgba(0,0,0,0.1)`, paddingBottom: '10px' }}>
-                <div>
-                  <h3 style={{ margin: 0, fontSize: '15px', fontWeight: 'bold', color: '#1f2937' }}>{cfg.label}</h3>
-                  <span style={{ fontSize: '11px', color: '#6b7280' }}>{cfg.sub}</span>
-                </div>
-                <span style={{ background: '#1f2937', color: 'white', borderRadius: '999px', padding: '2px 10px', fontSize: '13px', fontWeight: '700' }}>
-                  {columnTickets.length}
-                </span>
-              </div>
-
-              {/* Conteneur des cartes */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                {columnTickets.length === 0 ? (
-                  <p style={{ textAlign: 'center', color: '#9ca3af', fontSize: '13px', marginTop: '40px', fontStyle: 'italic' }}>Aucun ticket</p>
-                ) : (
-                  columnTickets.map(ticket => (
-                    <div
-                      key={ticket.id}
-                      draggable
-                      onDragStart={(e) => handleDragStart(e, ticket)}
-                      onClick={() => handleTicketClick(ticket)}
-                      style={{
-                        background: 'white',
-                        padding: '12px 14px',
-                        borderRadius: '8px',
-                        boxShadow: '0 1px 4px rgba(0,0,0,0.08)',
+            return (
+              <div 
+                key={status} 
+                onDragOver={(e) => handleDragOver(e, status)} 
+                onDragLeave={handleDragLeave} 
+                onDrop={(e) => handleDrop(e, status)} 
+                style={{ 
+                  backgroundColor: cfg.color, 
+                  minHeight: '600px', 
+                  padding: '16px', 
+                  borderRadius: '12px',
+                  boxShadow: isOver ? '0 0 0 3px #3b82f6 inset' : 'none',
+                  transition: 'all 0.2s ease'
+                }}
+              >
+                <h3 style={{ margin: '0 0 16px 0', color: '#111827', fontSize: '18px', borderBottom: '2px solid rgba(0,0,0,0.06)', paddingBottom: '8px' }}>
+                  {cfg.label} <span style={{ fontSize: '14px', color: '#4b5563', fontWeight: 'normal' }}>({columnTickets.length})</span>
+                </h3>
+                
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                  {columnTickets.map(ticket => (
+                    <div 
+                      key={ticket.id} 
+                      draggable 
+                      onDragStart={(e) => handleDragStart(e, ticket)} 
+                      style={{ 
+                        background: 'white', 
+                        padding: '14px', 
+                        borderRadius: '8px', 
+                        boxShadow: '0 2px 4px rgba(0,0,0,0.08)', 
                         cursor: 'grab',
-                        color: '#1f2937',
-                        borderLeft: `4px solid ${Number(ticket.type) === 2 ? '#3b82f6' : '#ef4444'}`,
+                        borderLeft: `5px solid ${ticket.type === 1 ? '#ef4444' : '#3b82f6'}`,
+                        color: '#1f2937' // Évite le texte blanc invisible
                       }}
                     >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#6b7280', marginBottom: '5px' }}>
-                        <span style={{ fontWeight: 600 }}>#{ticket.id}</span>
-                        <span style={{
-                          background: Number(ticket.type) === 2 ? '#eff6ff' : '#fef2f2',
-                          color:      Number(ticket.type) === 2 ? '#2563eb' : '#dc2626',
-                          padding: '1px 6px', borderRadius: '4px', fontSize: '10px', fontWeight: 600
+                      {/* En-tête de la carte */}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                        <span style={{ fontSize: '12px', fontWeight: 'bold', color: '#6b7280' }}>#{ticket.id}</span>
+                        <span style={{ 
+                          fontSize: '11px', 
+                          padding: '2px 6px', 
+                          borderRadius: '4px', 
+                          background: ticket.type === 1 ? '#fee2e2' : '#dbeafe', 
+                          color: ticket.type === 1 ? '#991b1b' : '#1e40af',
+                          fontWeight: '600'
                         }}>
-                          {TYPE_LABEL[ticket.type] || 'N/A'}
+                          {TYPE_LABEL[ticket.type] || `Type ${ticket.type}`}
                         </span>
                       </div>
-
-                      <h4 style={{ margin: '0 0 6px 0', fontSize: '13px', fontWeight: '700', lineHeight: 1.3 }}>
-                        {ticket.name || '(Sans titre)'}
+                      
+                      {/* Titre du ticket */}
+                      <h4 style={{ margin: '0 0 10px 0', fontSize: '14px', fontWeight: '600', color: '#111827', lineHeight: '1.4' }}>
+                        {ticket.name || 'Sans titre'}
                       </h4>
 
-                      <p style={{ margin: 0, fontSize: '12px', color: '#6b7280', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {ticket.content ? ticket.content.replace(/<[^>]*>/g, '') : '—'} {/* Nettoyage HTML basique de GLPI */}
-                      </p>
+                      {/* Métadonnées */}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '12px', fontSize: '12px' }}>
+                        <span style={{ padding: '2px 6px', borderRadius: '4px', background: '#f3f4f6', color: '#374151', fontWeight: '500' }}>
+                          Prio : {PRIORITY_LABEL[ticket.priority] || ticket.priority}
+                        </span>
+                        {ticket.date && (
+                          <span style={{ color: '#6b7280', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                            <Clock size={12} /> {ticket.date.split(' ')[0]}
+                          </span>
+                        )}
+                      </div>
 
-                      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '8px', fontSize: '11px', color: '#9ca3af' }}>
-                        <span>Priorité : {PRIORITY_LABEL[ticket.priority] || ticket.priority || 'Moyenne'}</span>
-                        <span>{ticket.date ? ticket.date.substring(0, 10) : ''}</span>
+                      {/* Bouton d'accès aux détails */}
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', borderTop: '1px solid #f3f4f6', paddingTop: '8px' }}>
+                        <button 
+                          onClick={() => handleOpenDetails(ticket)}
+                          style={{ 
+                            background: 'none', 
+                            border: 'none', 
+                            color: '#2563eb', 
+                            fontSize: '12px', 
+                            cursor: 'pointer', 
+                            display: 'flex', 
+                            alignItems: 'center', 
+                            gap: '4px',
+                            fontWeight: '600',
+                            padding: '4px'
+                          }}
+                        >
+                          <Eye size={14} /> Voir les détails
+                        </button>
                       </div>
                     </div>
-                  ))
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      {/* MODAL COMPLET : Détails du ticket récupérés de l'API */}
-      {selectedTicket && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000 }} onClick={() => setSelectedTicket(null)}>
-          <div className="glass-panel" onClick={e => e.stopPropagation()} style={{ background: 'white', padding: '28px', borderRadius: '14px', maxWidth: '650px', width: '100%', maxHeight: '85vh', overflowY: 'auto', color: '#1f2937' }}>
-            
-            <h2 style={{ margin: '0 0 20px 0', fontSize: '20px', borderBottom: '2px solid #f3f4f6', paddingBottom: '10px' }}>
-              Détails du Ticket #{selectedTicket.id}
-            </h2>
-
-            {loadingDetails ? (
-              <div style={{ padding: '40px', textAlign: 'center', color: '#6b7280' }}>
-                <p>Chargement des informations en temps réel depuis GLPI...</p>
-              </div>
-            ) : ticketDetails ? (
-              <div>
-                {/* Infos principales */}
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '20px' }}>
-                  <div><strong>Titre :</strong> {ticketDetails.name || '—'}</div>
-                  <div><strong>Description :</strong> 
-                    <div style={{ background: '#f9fafb', padding: '10px', borderRadius: '6px', marginTop: '5px', fontSize: '13px' }} dangerouslySetInnerHTML={{ __html: ticketDetails.content }} />
-                  </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                    <div><strong>Type :</strong> {TYPE_LABEL[ticketDetails.type] || 'Inconnu'}</div>
-                    <div><strong>Priorité :</strong> {PRIORITY_LABEL[ticketDetails.priority] || ticketDetails.priority}</div>
-                    <div><strong>Date de création :</strong> {ticketDetails.date}</div>
-                    <div><strong>Dernière modification :</strong> {ticketDetails.date_mod}</div>
-                  </div>
+                  ))}
+                  
+                  {columnTickets.length === 0 && (
+                    <div style={{ textAlign: 'center', padding: '20px', color: '#6b7280', border: '2px dashed rgba(0,0,0,0.05)', borderRadius: '8px', fontSize: '13px' }}>
+                      Aucun ticket
+                    </div>
+                  )}
                 </div>
-
-                {/* Équipements liés (Item_Ticket) */}
-                <h3 style={{ fontSize: '15px', borderTop: '1px solid #e5e7eb', paddingTop: '15px', marginTop: '15px' }}>Matériels & Équipements associés</h3>
-                {ticketDetails.items.length === 0 ? <p style={{ fontSize: '13px', color: '#9ca3af', fontStyle: 'italic' }}>Aucun équipement lié à ce ticket.</p> : (
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', marginTop: '5px' }}>
-                    <thead>
-                      <tr style={{ background: '#f3f4f6', textAlign: 'left' }}>
-                        <th style={{ padding: '6px' }}>Type</th>
-                        <th style={{ padding: '6px' }}>ID Équipement</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {ticketDetails.items.map((item, idx) => (
-                        <tr key={idx} style={{ borderBottom: '1px solid #f3f4f6' }}>
-                          <td style={{ padding: '6px' }}>{item.itemtype}</td>
-                          <td style={{ padding: '6px' }}>{item.items_id}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-
-                {/* Coûts associés (TicketCost) */}
-                <h3 style={{ fontSize: '15px', borderTop: '1px solid #e5e7eb', paddingTop: '15px', marginTop: '15px' }}>Coûts financiers</h3>
-                {ticketDetails.costs.length === 0 ? <p style={{ fontSize: '13px', color: '#9ca3af', fontStyle: 'italic' }}>Aucun coût enregistré.</p> : (
-                  <ul style={{ fontSize: '13px', paddingLeft: '20px' }}>
-                    {ticketDetails.costs.map((cost, idx) => (
-                      <li key={idx}>
-                        <strong>{cost.name || 'Coût'} :</strong> {cost.cost} € (Matériel : {cost.itemcost || '0'} €)
-                      </li>
-                    ))}
-                  </ul>
-                )}
               </div>
-            ) : (
-              <p style={{ color: '#ef4444' }}>Erreur lors du chargement des détails.</p>
-            )}
-
-            <div style={{ textAlign: 'right', marginTop: '24px', borderTop: '1px solid #e5e7eb', paddingTop: '15px' }}>
-              <button className="btn" style={{ background: '#4b5563', color: 'white', border: 'none', padding: '8px 16px', borderRadius: '6px', cursor: 'pointer' }} onClick={() => setSelectedTicket(null)}>Fermer</button>
-            </div>
-          </div>
+            );
+          })}
         </div>
       )}
 
-      {/* MODAL : Boîte de dialogue pour clôture obligatoire avec commentaire */}
-      {transitioningTicket && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1000 }}>
-          <div className="glass-panel" style={{ background: 'white', padding: '28px', borderRadius: '14px', maxWidth: '420px', width: '100%', color: '#1f2937' }}>
-            <h3 style={{ margin: '0 0 10px 0', fontSize: '16px' }}>Clôturer le ticket ?</h3>
-            <p style={{ fontSize: '14px', color: '#4b5563', marginBottom: '16px' }}>
-              Ticket <strong>#{transitioningTicket.ticket.id}</strong> → <strong>{kanbanConfig.Closed.label} (Closed)</strong>.<br/>
-              Veuillez saisir un commentaire de résolution pour GLPI :
-            </p>
-            <textarea
-              rows={3}
-              value={comment}
-              onChange={e => setComment(e.target.value)}
-              placeholder="Décrivez la solution apportée..."
-              style={{ width: '100%', boxSizing: 'border-box', padding: '10px', borderRadius: '6px', border: '1px solid #d1d5db', resize: 'vertical' }}
+      {/* ── MODAL 1 : PASSAGE À CLOSED (SAISIE DU NOUVEAU COÛT) ── */}
+      {transitioningTicket && transitioningTicket.mode === 'close' && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 2000 }}>
+          <div style={{ background: 'white', padding: '24px', borderRadius: '10px', maxWidth: '400px', width: '100%', boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)' }}>
+            <h3 style={{ margin: '0 0 12px 0', color: '#111827' }}>Clôture du Ticket #{transitioningTicket.ticket.id}</h3>
+            <p style={{ color: '#4b5563', fontSize: '14px', marginBottom: '16px' }}>Veuillez renseigner le nouveau coût de clôture pour valider le passage au statut <strong>Terminé</strong> :</p>
+            <input 
+              type="number" 
+              value={newCostAmount} 
+              onChange={e => setNewCostAmount(e.target.value)} 
+              placeholder="Montant du coût (€)" 
+              style={{ width: '100%', boxSizing: 'border-box', padding: '10px', marginBottom: '20px', borderRadius: '6px', border: '1px solid #d1d5db', color: '#111827' }} 
             />
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px' }}>
-              <button className="btn" style={{ padding: '8px 12px', background: '#e5e7eb', border: 'none', borderRadius: '6px', cursor: 'pointer' }} onClick={() => setTransitioningTicket(null)}>Annuler</button>
-              <button
-                className="btn btn-primary"
-                onClick={confirmTransition}
-                disabled={!comment.trim()}
-                style={{ padding: '8px 12px', background: '#2563eb', color: 'white', border: 'none', borderRadius: '6px', cursor: comment.trim() ? 'pointer' : 'not-allowed', opacity: comment.trim() ? 1 : 0.5 }}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+              <button 
+                onClick={() => setTransitioningTicket(null)} 
+                style={{ padding: '8px 14px', borderRadius: '6px', border: '1px solid #d1d5db', background: 'white', color: '#374151', cursor: 'pointer' }}
               >
-                Valider la clôture
+                Annuler
+              </button>
+              <button 
+                onClick={async () => {
+                  const val = parseFloat(newCostAmount);
+                  if (isNaN(val) || val <= 0) {
+                    alert("Veuillez entrer un montant valide supérieur à 0.");
+                    return;
+                  }
+                  setSavingTransition(true);
+                  await updateTicketStatus(transitioningTicket.ticket.id, transitioningTicket.targetStatus);
+                  await ticketService.addTicketCost(transitioningTicket.ticket.id, val);
+                  setSavingTransition(false);
+                  setTransitioningTicket(null);
+                }} 
+                disabled={savingTransition}
+                style={{ padding: '8px 14px', background: '#2563eb', color: 'white', borderRadius: '6px', border: 'none', cursor: 'pointer', fontWeight: '600' }}
+              >
+                {savingTransition ? 'Sauvegarde...' : 'Confirmer Clôture'}
               </button>
             </div>
           </div>
         </div>
       )}
+
+      {/* ── MODAL 2 : DE CLOSED À IN_PROGRESS (ANNULATION OU RÉOUVERTURE PAR %) ── */}
+      {transitioningTicket && transitioningTicket.mode === 'reopen' && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 2000 }}>
+          <div style={{ background: 'white', padding: '24px', borderRadius: '10px', maxWidth: '460px', width: '100%', boxShadow: '0 20px 25px -5px rgba(0,0,0,0.1)' }}>
+            <h3 style={{ margin: '0 0 6px 0', color: '#111827' }}>Réouverture du Ticket #{transitioningTicket.ticket.id}</h3>
+            <p style={{ fontSize: '14px', color: '#4b5563', marginBottom: '16px' }}>
+              Dernier coût brut enregistré : <strong style={{ color: '#111827' }}>{lastCostAmount.toFixed(2)} €</strong>
+            </p>
+            
+            <div style={{ marginBottom: '20px', background: '#f9fafb', padding: '12px', borderRadius: '6px', border: '1px solid #e5e7eb' }}>
+              <label style={{ display: 'block', fontSize: '13px', marginBottom: '6px', fontWeight: '600', color: '#374151' }}>
+                Option 1 : Appliquer un pourcentage pour frais de réouverture
+              </label>
+              <input 
+                type="number" 
+                value={reopenPercentage} 
+                onChange={e => setReopenPercentage(e.target.value)} 
+                placeholder="Ex: 10 pour intégrer 10% du dernier coût" 
+                style={{ width: '100%', boxSizing: 'border-box', padding: '8px', borderRadius: '4px', border: '1px solid #d1d5db', color: '#111827' }} 
+              />
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '24px', borderTop: '1px solid #f3f4f6', paddingTop: '16px' }}>
+              <button 
+                onClick={() => setTransitioningTicket(null)} 
+                style={{ padding: '8px 12px', background: '#e5e7eb', color: '#374151', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
+              >
+                Fermer
+              </button>
+
+              <div style={{ display: 'flex', gap: '8px' }}>
+                {/* ACTION A : ANNULER LE DERNIER COÛT (ajoute un mouvement 'cancel' compensatoire, rien n'est supprimé) */}
+                <button 
+                  onClick={async () => {
+                    if (window.confirm("Confirmez-vous l'annulation du dernier coût de clôture ? Un mouvement compensatoire sera ajouté à l'historique (rien n'est supprimé).")) {
+                      setSavingTransition(true);
+                      const res = await ticketService.cancelLastCost(transitioningTicket.ticket.id);
+                      if (!res || !res.success) {
+                        alert(res?.error || "Impossible d'annuler : aucun coût de clôture trouvé pour ce ticket.");
+                        setSavingTransition(false);
+                        return;
+                      }
+                      await updateTicketStatus(transitioningTicket.ticket.id, transitioningTicket.targetStatus);
+                      setSavingTransition(false);
+                      setTransitioningTicket(null);
+                    }
+                  }} 
+                  disabled={savingTransition} 
+                  style={{ padding: '8px 12px', background: '#ef4444', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '500' }}
+                >
+                  Annuler le dernier coût
+                </button>
+
+                {/* ACTION B : APPLIQUER LES FRAIS PAR POURCENTAGE */}
+                <button 
+                  onClick={async () => {
+                    const pct = parseFloat(reopenPercentage);
+                    if (isNaN(pct) || pct <= 0) {
+                      alert("Veuillez insérer un pourcentage valide.");
+                      return;
+                    }
+                    setSavingTransition(true);
+                    const calculatedFrais = (lastCostAmount * pct) / 100;
+                    // Insertion dynamique comme frais de réouverture
+                    await ticketService.addTicketFrais(transitioningTicket.ticket.id, calculatedFrais);
+                    await updateTicketStatus(transitioningTicket.ticket.id, transitioningTicket.targetStatus);
+                    setSavingTransition(false);
+                    setTransitioningTicket(null);
+                  }} 
+                  disabled={savingTransition || !reopenPercentage} 
+                  style={{ padding: '8px 12px', background: '#d97706', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '500' }}
+                >
+                  Confirmer réouverture
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── MODAL 3 : CONSULTATION COMPLÈTE DES DÉTAILS D'UN TICKET ── */}
+      {selectedTicket && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', justifyContent: 'center', alignItems: 'center', zIndex: 1900 }}>
+          <div style={{ background: 'white', padding: '28px', borderRadius: '12px', maxWidth: '650px', width: '100%', maxHeight: '85vh', overflowY: 'auto', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)', color: '#1f2937' }}>
+            
+            {/* Entête Modal */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px', borderBottom: '1px solid #e5e7eb', paddingBottom: '12px' }}>
+              <div>
+                <span style={{ fontSize: '13px', color: '#6b7280', fontWeight: 'bold' }}>TICKET #{selectedTicket.id}</span>
+                <h2 style={{ margin: '4px 0 0 0', fontSize: '20px', color: '#111827' }}>{selectedTicket.name || 'Sans titre'}</h2>
+              </div>
+              <button 
+                onClick={() => setSelectedTicket(null)} 
+                style={{ background: 'none', border: 'none', color: '#9ca3af', cursor: 'pointer', padding: '4px' }}
+              >
+                <X size={22} />
+              </button>
+            </div>
+
+            {/* Contenu / Description GLPI */}
+            <div style={{ marginBottom: '20px' }}>
+              <h4 style={{ margin: '0 0 6px 0', color: '#4b5563', fontSize: '14px' }}>Description du ticket :</h4>
+              <div 
+                style={{ background: '#f9fafb', padding: '12px', borderRadius: '6px', border: '1px solid #e5e7eb', fontSize: '14px', lineHeight: '1.5', whiteSpace: 'pre-wrap', color: '#111827' }}
+                dangerouslySetInnerHTML={{ __html: selectedTicket.content || '<span style="color:#9ca3af;">Aucune description fournie.</span>' }}
+              />
+            </div>
+
+            {/* Métadonnées en grille */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '24px', fontSize: '13px' }}>
+              <div><strong>Type :</strong> {TYPE_LABEL[selectedTicket.type] || selectedTicket.type}</div>
+              <div><strong>Priorité :</strong> {PRIORITY_LABEL[selectedTicket.priority] || selectedTicket.priority}</div>
+              <div><strong>Statut Kanban :</strong> <span style={{ fontWeight: 'bold' }}>{selectedTicket.Status}</span></div>
+              <div><strong>Date d'ouverture :</strong> {selectedTicket.date || 'Non renseignée'}</div>
+            </div>
+
+            {/* Historique financier issu de la Table Unique (mouvements) */}
+            <div style={{ borderTop: '1px solid #e5e7eb', paddingTop: '16px' }}>
+              <h3 style={{ margin: '0 0 12px 0', fontSize: '16px', color: '#111827', display: 'flex', justifyContent: 'space-between' }}>
+                <span>Historique des mouvements financiers</span>
+                <span style={{ color: '#16a34a' }}>Total Net : {totalCost.toFixed(2)} €</span>
+              </h3>
+
+              {loadingDetails ? (
+                <p style={{ fontSize: '13px', color: '#6b7280', fontStyle: 'italic' }}>Chargement des lignes budgétaires...</p>
+              ) : localMouvements.length > 0 ? (
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', textAlign: 'left' }}>
+                  <thead>
+                    <tr style={{ background: '#f3f4f6', borderBottom: '2px solid #e5e7eb' }}>
+                      <th style={{ padding: '8px' }}>Type Mouvement</th>
+                      <th style={{ padding: '8px', textAlign: 'right' }}>Montant</th>
+                      <th style={{ padding: '8px' }}>Date</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {localMouvements.map((mvt) => {
+                      const display = MOUVEMENT_DISPLAY[mvt.mouvement] || { label: mvt.mouvement, color: '#111827' };
+                      const amount = parseFloat(mvt.amount) || 0;
+                      return (
+                        <tr key={mvt.id} style={{ borderBottom: '1px solid #f3f4f6' }}>
+                          <td style={{ padding: '8px', fontWeight: '500', color: display.color }}>
+                            {display.label}
+                          </td>
+                          <td style={{ padding: '8px', textAlign: 'right', fontWeight: '600', color: display.color }}>
+                            {amount >= 0 ? '+' : ''}{amount.toFixed(2)} €
+                          </td>
+                          <td style={{ padding: '8px', color: '#6b7280', fontSize: '12px' }}>
+                            {mvt.created_at}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              ) : (
+                <p style={{ fontSize: '13px', color: '#9ca3af', fontStyle: 'italic' }}>Aucun mouvement financier enregistré pour le moment sur la table unique.</p>
+              )}
+            </div>
+
+            {/* Bouton de fermeture */}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '28px', borderTop: '1px solid #e5e7eb', paddingTop: '16px' }}>
+              <button 
+                onClick={() => setSelectedTicket(null)} 
+                style={{ padding: '8px 16px', background: '#374151', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '600' }}
+              >
+                Fermer les détails
+              </button>
+            </div>
+
+          </div>
+        </div>
+      )}
+
     </div>
   );
 };

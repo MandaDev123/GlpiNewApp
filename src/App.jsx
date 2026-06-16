@@ -8,6 +8,7 @@ import ProtectedRoute from './components/ProtectedRoute';
 
 // FrontOffice
 import ItemList from './pages/front/ItemList';
+import Cout from './pages/front/CostsSummary';
 import CreateTicket from './pages/front/CreateTicket';
 import TicketKanban from './pages/front/TicketKanban'; //
 
@@ -15,6 +16,7 @@ import TicketKanban from './pages/front/TicketKanban'; //
 import Login from './pages/admin/Login';
 import Dashboard from './pages/admin/Dashboard';
 import ImportData from './pages/admin/Import';
+import ImportTicket from './pages/admin/ImportTicket';
 import Reset from './pages/admin/Reset';
 import Tickets from './pages/admin/Tickets';
 import TicketDetail from './pages/admin/TicketDetail';
@@ -31,11 +33,12 @@ function App() {
             <Navbar />
             <main style={{ flex: 1, padding: '0 24px', maxWidth: '1200px', margin: '0 auto', width: '100%' }}>
               <Routes>
-                {/* FrontOffice Routes */}
                 <Route path="/" element={<ItemList />} />
                 <Route path="/create-ticket" element={<CreateTicket />} />
                 {/* Route publique pour voir le tableau Kanban */}
                 <Route path="/kanban" element={<TicketKanban />} />
+
+                <Route path="/cout" element={<Cout />} />
 
                 {/* BackOffice Routes */}
                 <Route path="/login" element={<Login />} />
@@ -49,6 +52,11 @@ function App() {
                 <Route path="/admin/import" element={
                   <ProtectedRoute>
                     <ImportData />
+                  </ProtectedRoute>
+                } />
+                <Route path="/admin/importTicket" element={
+                  <ProtectedRoute>
+                    <ImportTicket />
                   </ProtectedRoute>
                 } />
                 <Route path="/admin/reset" element={

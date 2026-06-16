@@ -1,10 +1,5 @@
-// src/services/ticketService.js
 import api, { initSession } from './glpiApi.js';
 
-/**
- * Fonction utilitaire qui vérifie si un Session-Token est présent.
- * Si ce n'est pas le cas, elle initialise la session automatiquement.
- */
 const ensureSession = async () => {
   if (!api.defaults.headers.common['Session-Token']) {
     console.log("Aucun token de session trouvé, initialisation en cours...");
@@ -12,9 +7,6 @@ const ensureSession = async () => {
   }
 };
 
-/**
- * Convertisseur pour que les priorités de ton UI correspondent aux IDs de GLPI
- */
 const parsePriority = (priorityStr) => {
   switch (priorityStr?.toLowerCase()) {
     case 'low': return 2;
@@ -27,117 +19,122 @@ const parsePriority = (priorityStr) => {
 
 const parseStatus = (statusStr) => {
   switch (statusStr?.toLowerCase().trim()) {
-    case 'nouveau':  return 1; // Nouveau
-    case 'en cours': return 2; // En cours (Assigné)
-    case 'clos':     return 6; // Clos
+    case 'nouveau':  return 1;
+    case 'en cours': return 2;
+    case 'clos':     return 6;
     default:         return 1;
   }
 };
 
+const LOCAL_API_BASE = 'http://localhost:5000/api';
+
+// ── TYPES DE MOUVEMENTS (table unique côté backend) ─────────────────────────
+// open   = réouverture (frais de réouverture)
+// cancel = annulation (compense un mouvement 'close' précédent)
+// close  = clôture (nouveau coût)
+export const MOUVEMENT_TYPES = {
+  OPEN: 'open',
+  CANCEL: 'cancel',
+  CLOSE: 'close',
+};
+
+// Table de correspondance pour normaliser des libellés "humains" (FR/Malgache/variantes)
+// vers les 3 valeurs canoniques attendues par la base.
+const MOUVEMENT_ALIASES = {
+  open: 'open',
+  ouverture: 'open',
+  reouverture: 'open',
+
+  cancel: 'cancel',
+  annulation: 'cancel',
+  annule: 'cancel',
+
+  close: 'close',
+  cloture: 'close',
+  fermeture: 'close',
+  termine: 'close',
+};
+
+// Retire les accents et met en minuscule pour faciliter le matching
+const stripAccents = (str) =>
+  str.toString().toLowerCase().trim().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+// Normalise une valeur de mouvement libre (venant d'un CSV par ex.) vers 'open' | 'cancel' | 'close'.
+// Retourne null si la valeur ne correspond à aucun type connu.
+export const normalizeMouvement = (value) => {
+  if (!value) return null;
+  const key = stripAccents(value);
+  return MOUVEMENT_ALIASES[key] || null;
+};
+
+export const computeGlpiCostTotal = (costs) => {
+  const list = Array.isArray(costs) ? costs : [];
+  const totalTimeCost = list.reduce((sum, c) => {
+    const durationMin = parseInt(c.actiontime || 0) / 60;
+    const hourlyRate  = parseFloat(c.cost_time || 0);
+    return sum + (durationMin / 60) * hourlyRate;
+  }, 0);
+
+  const totalFixedCost    = list.reduce((sum, c) => sum + parseFloat(c.cost_fixed || 0), 0);
+  const totalMaterialCost = list.reduce((sum, c) => sum + parseFloat(c.cost_material || 0), 0);
+
+  return totalTimeCost + totalFixedCost + totalMaterialCost;
+};
+
 export const ticketService = {
-  /**
-   * Récupère tous les tickets avec les valeurs lisibles (expand_dropdowns)
-   */
   getAllTickets: async () => {
     await ensureSession();
-    
     try {
       const response = await api.get('/Ticket/', {
-        params: {
-          expand_dropdowns: true,
-          range: '0-100'
-          // On retire sort: 19 et order: 'DESC' pour le test
-        }
+        params: { expand_dropdowns: true, range: '0-100' }
       });
       return response.data;
     } catch (error) {
-      // Afficher le VRAI message d'erreur caché renvoyé par GLPI
-      if (error.response && error.response.data) {
-        console.error("Détail de l'erreur renvoyée par GLPI :", error.response.data);
-      } else {
-        console.error("Erreur lors de la récupération des tickets :", error);
-      }
       return [];
     }
   },
 
-  /**
-   * Récupère un ticket spécifique par son ID
-   */
   getTicketById: async (id) => {
     await ensureSession();
-    
     try {
-      const response = await api.get(`/Ticket/${id}`, {
-        params: { expand_dropdowns: true }
-      });
+      const response = await api.get(`/Ticket/${id}`, { params: { expand_dropdowns: true } });
       return response.data;
     } catch (error) {
-      console.error(`Erreur lors de la récupération du ticket ${id}`, error);
       throw error;
     }
   },
 
-  /**
-   * Récupère les coûts associés à un ticket
-   */
   getTicketCosts: async (ticketId) => {
     await ensureSession();
-    
     try {
-      const response = await api.get('/TicketCost/', {
-        params: { searchText: { tickets_id: ticketId } }
-      });
+      const response = await api.get('/TicketCost/', { params: { searchText: { tickets_id: ticketId } } });
       return response.data;
     } catch (error) {
-      // Tolérance : Si aucun coût n'existe, GLPI peut renvoyer 400
       if (error.response && error.response.status === 400) return [];
-      console.error(`Erreur lors de la récupération des coûts du ticket ${ticketId}`, error);
       return [];
     }
   },
 
-  /**
-   * Récupère les équipements liés (Item_Ticket)
-   */
   getTicketItems: async (ticketId) => {
     await ensureSession();
-    
     try {
-      const response = await api.get('/Item_Ticket/', {
-        params: { 
-          searchText: { tickets_id: ticketId },
-          expand_dropdowns: true
-        }
-      });
+      const response = await api.get('/Item_Ticket/', { params: { searchText: { tickets_id: ticketId }, expand_dropdowns: true } });
       return response.data;
     } catch (error) {
-      // Tolérance : Si aucun équipement lié n'existe
       if (error.response && error.response.status === 400) return [];
-      console.error(`Erreur lors de la récupération des équipements du ticket ${ticketId}`, error);
       return [];
     }
   },
 
-  
-
-  /**
-   * Crée un nouveau ticket et y associe des équipements (optionnel)
-   */
-createTicket: async (formData, selectedItems) => {
+  createTicket: async (formData, selectedItems) => {
     await ensureSession();
-
     try {
-      // Formatage de la date : conversion de "YYYY-MM-DDTHH:MM" vers "YYYY-MM-DD HH:MM:SS"
       let formattedDate = undefined;
       if (formData.Date) {
         formattedDate = formData.Date.replace('T', ' ');
-        if (formattedDate.length === 16) {
-          formattedDate += ':00'; 
-        }
+        if (formattedDate.length === 16) formattedDate += ':00';
       }
 
-      // 1. Préparation du payload pour le Ticket
       const ticketPayload = {
         input: {
           name: formData.Titre,
@@ -149,53 +146,136 @@ createTicket: async (formData, selectedItems) => {
         }
       };
 
-      console.log("Envoi du payload Ticket à GLPI :", ticketPayload);
       const ticketResponse = await api.post('/Ticket/', ticketPayload);
       const ticketId = ticketResponse.data.id;
 
-      // 2. Association groupée de TOUS les équipements (Bulk insert)
       if (selectedItems && selectedItems.length > 0) {
-        // GLPI accepte un tableau d'objets directement dans 'input'
         const itemsPayload = {
           input: selectedItems
-            .filter(item => item.id && item.glpiType) // Sécurité
+            .filter(item => item.id && item.glpiType)
             .map(item => ({
               tickets_id: ticketId,
-              itemtype: item.glpiType, // Doit être 'Computer', 'Monitor', 'Phone', etc.
+              itemtype: item.glpiType,
               items_id: item.id
             }))
         };
-
-        console.log("Envoi de l'association des équipements à GLPI :", itemsPayload);
         await api.post('/Item_Ticket/', itemsPayload);
       }
-
       return ticketId;
     } catch (error) {
-      console.error("Erreur lors de la création du ticket ou de la liaison :", error);
       throw error;
     }
   },
-  /**
-   * Met à jour un ticket existant (ex: changement de statut ou ajout de solution)
-   */
+
+  // Ajoute un coût local lié à la clôture du ticket (mouvement = 'close')
+  addTicketCost: async (ticketId, amount) => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/mouvements`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticket_id: ticketId, mouvement: MOUVEMENT_TYPES.CLOSE, amount })
+      });
+      return await response.json();
+    } catch (error) {
+      throw error;
+    }
+  },
+
+  // Annule le dernier coût de clôture (ajoute un mouvement 'cancel' compensatoire, sans rien supprimer)
+  cancelLastCost: async (ticketId) => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/mouvements/cancel-last/${ticketId}`, {
+        method: 'POST'
+      });
+      return await response.json();
+    } catch (error) {
+      console.error("Erreur annulation coût:", error);
+      throw error;
+    }
+  },
+
+  // Récupère le dernier montant de clôture enregistré pour le pré-calcul (ignore les annulations)
+  getLastCostAmount: async (ticketId) => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/mouvements/close/${ticketId}`);
+      const data = await response.json();
+      const lastClose = (data.items || []).find(item => item.mouvement === MOUVEMENT_TYPES.CLOSE);
+      return lastClose ? lastClose.amount : 0;
+    } catch {
+      return 0;
+    }
+  },
+
+  // Détail + total des coûts de clôture ('close' + 'cancel') pour un ticket
+  getLocalTicketCosts: async (ticketId) => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/mouvements/close/${ticketId}`);
+      return await response.json();
+    } catch (error) {
+      return { items: [], total: 0 };
+    }
+  },
+
+  // Ajoute des frais de réouverture (mouvement = 'open')
+  addTicketFrais: async (ticketId, amount) => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/mouvements`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticket_id: ticketId, mouvement: MOUVEMENT_TYPES.OPEN, amount })
+      });
+      return await response.json();
+    } catch (error) {
+      throw error;
+    }
+  },
+
+  // Totaux ('close' + 'cancel') groupés par ticket, pour tous les tickets
+  getAllLocalCostTotals: async () => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/mouvements/totals/close`);
+      return await response.json();
+    } catch (error) {
+      return {};
+    }
+  },
+
+  // Totaux ('open') groupés par ticket, pour tous les tickets
+  getAllLocalFraisTotals: async () => {
+    try {
+      const response = await fetch(`${LOCAL_API_BASE}/mouvements/totals/open`);
+      return await response.json();
+    } catch (error) {
+      return {};
+    }
+  },
+
   updateTicket: async (ticketId, payload) => {
     await ensureSession();
-    
     try {
-      // GLPI utilise généralement un POST sur l'endpoint avec l'id dans le body input pour les updates,
-      // ou un PUT selon la configuration. La norme GLPI REST officielle est un PUT /Ticket/:id
       const response = await api.put(`/Ticket/${ticketId}`, {
-        input: {
-          id: ticketId,
-          ...payload
-        }
+        input: { id: ticketId, ...payload }
       });
       return response.data;
     } catch (error) {
-      console.error(`Erreur lors de la mise à jour du ticket ${ticketId} :`, error);
       throw error;
     }
+  },
+
+  // Import en masse de mouvements (ex: depuis un CSV) — chaque mouvement doit déjà être normalisé
+  // vers 'open' | 'cancel' | 'close' avant l'appel (voir normalizeMouvement).
+  importTicket: async (mouvement) => {
+    const response = await fetch(`${LOCAL_API_BASE}/mouvements/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mouvement })
+    });
+    return await response.json();
+  },
+
+  // Historique complet des mouvements (tous types) pour un ticket
+  getTicketMouvement: async (ticketId) => {
+    const response = await fetch(`${LOCAL_API_BASE}/mouvements/${ticketId}`);
+    return await response.json();
   }
-  
 };
